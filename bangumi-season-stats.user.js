@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bangumi 季度番剧统计
 // @namespace    bgm-season-stats
-// @version      1.2.3
-// @description  统计 Bangumi 用户“看过/在看”收藏中 TV 动画的季度分布（依据条目标签中的 “xxxx年x月”，如 2025年1月；特殊开播月份归入所属季度：1-3月→1月季、4-6月→4月季、7-9月→7月季、10-12月→10月季），以柱状图直观展示每个季度看了多少部动画。入口为个人主页“加入”日期所在行的蓝色胶囊“季度番剧统计 + 启动”，仅本用户主页显示。
+// @version      1.3.0
+// @description  统计 Bangumi 用户“看过/在看”收藏中 TV 动画的季度分布（依据条目标签中的 “xxxx年x月”，如 2025年1月；特殊开播月份归入所属季度：1-3月→1月季、4-6月→4月季、7-9月→7月季、10-12月→10月季），以柱状图直观展示每个季度看了多少部动画。入口为个人主页“加入”日期所在行的蓝色胶囊“季度番剧统计 + 启动”，点击后自动填入当前主页用户名，仅本用户主页显示。
 // @author       dsh
 // @match        *://bgm.tv/*
 // @match        *://bangumi.tv/*
@@ -19,7 +19,7 @@
   // ---------------------------------------------------------------------------
   // 常量
   // ---------------------------------------------------------------------------
-  var VERSION = '1.2.3';
+  var VERSION = '1.3.0';
   var UA = (typeof navigator !== 'undefined' && navigator.userAgent) || 'Mozilla/5.0';
   // 季度标签：仅匹配 "xxxx年x月"（例如 2025年1月、2026年7月）
   var SEASON_RE = /^(\d{4})\s*年\s*(\d{1,2})\s*月$/;
@@ -429,6 +429,14 @@
   async function startRun() {
     if (state.running) return;
     var user = (dom.userInput.value || '').trim();
+    if (!user) {
+      // 兜底：直接用当前个人主页的用户名
+      var pu = currentProfileUser();
+      if (pu) {
+        user = pu;
+        dom.userInput.value = pu;
+      }
+    }
     if (!user) {
       setLog('请输入 Bangumi 用户名', 'error');
       dom.userInput.focus();
@@ -887,6 +895,23 @@
   // UI 面板与入口
   // ---------------------------------------------------------------------------
 
+  // 从当前页面地址解析个人主页用户名（/user/{用户名}）
+  function currentProfileUser() {
+    var m = /^\/user\/([^\/?#]+)/.exec(location.pathname || '');
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+  }
+
+  // 自动把当前主页用户名填入面板（点击“启动”时调用）
+  function applyProfileUser() {
+    var u = currentProfileUser();
+    if (!u) return false;
+    settings.user = u;
+    saveSettings();
+    if (dom.userInput) dom.userInput.value = u;
+    return true;
+  }
+
   // 定位个人主页“加入”日期所在的元素（与 “2022-2-11 加入” 同级）
   function findJoinAnchor() {
     if (!document.body) return null;
@@ -1006,7 +1031,11 @@
     var joinEl = findJoinAnchor();
     if (joinEl) {
       var entry = createTriggerEntry();
-      entry.addEventListener('click', function (ev) { ev.preventDefault(); togglePanel(panel); });
+      entry.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        applyProfileUser(); // 点击“启动”自动填入当前主页用户名
+        togglePanel(panel);
+      });
       joinEl.insertAdjacentElement('afterend', entry);
       return;
     }
@@ -1019,6 +1048,7 @@
   function initUI() {
     if (document.getElementById('bgmSeasonStatsPanel')) return;
     var panel = buildPanel();
+    applyProfileUser(); // 主页直接预填，无需手动输入
     mountTrigger(panel, 0);
   }
 
