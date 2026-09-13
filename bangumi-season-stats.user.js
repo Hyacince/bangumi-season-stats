@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bangumi 季度番剧统计
 // @namespace    bgm-season-stats
-// @version      1.3.0
+// @version      1.3.1
 // @description  统计 Bangumi 用户“看过/在看”收藏中 TV 动画的季度分布（依据条目标签中的 “xxxx年x月”，如 2025年1月；特殊开播月份归入所属季度：1-3月→1月季、4-6月→4月季、7-9月→7月季、10-12月→10月季），以柱状图直观展示每个季度看了多少部动画。入口为个人主页“加入”日期所在行的蓝色胶囊“季度番剧统计 + 启动”，点击后自动填入当前主页用户名，仅本用户主页显示。
 // @author       dsh
 // @match        *://bgm.tv/*
@@ -19,7 +19,7 @@
   // ---------------------------------------------------------------------------
   // 常量
   // ---------------------------------------------------------------------------
-  var VERSION = '1.3.0';
+  var VERSION = '1.3.1';
   var UA = (typeof navigator !== 'undefined' && navigator.userAgent) || 'Mozilla/5.0';
   // 季度标签：仅匹配 "xxxx年x月"（例如 2025年1月、2026年7月）
   var SEASON_RE = /^(\d{4})\s*年\s*(\d{1,2})\s*月$/;
@@ -58,6 +58,7 @@
   var settings = loadSettings();
   var dom = {}; // 面板 DOM 引用
   var seasonOrder = []; // 渲染用：排序后的季度 key 列表
+  var userEdited = false; // 用户是否手动修改过用户名（修改后不再被自动填入覆盖）
 
   function loadSettings() {
     var d = {};
@@ -156,13 +157,15 @@
     });
   }
 
-  // 同源抓取 HTML（收藏列表页）
+  // 同源抓取 HTML（收藏列表页）。lastFetchedUrl 记录最终地址，用于检测跳转（对方收藏不可见等）
+  var lastFetchedUrl = '';
   async function httpHtml(url) {
     var lastErr = null;
     for (var i = 0; i < 3; i++) {
       if (state.stopped) return '';
       try {
         var resp = await fetch(url, { credentials: 'same-origin' });
+        lastFetchedUrl = resp.url || url;
         if (resp.status === 429) {
           await sleep(2500);
           continue;
@@ -175,6 +178,13 @@
     }
     if (lastErr) throw lastErr;
     return '';
+  }
+
+  // 从收藏列表地址中取出用户名（用于跳转校验）
+  function userFromListUrl(u) {
+    var m = /\/anime\/list\/([^\/?#]+)/.exec(u || '');
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
   }
 
   // ---------------------------------------------------------------------------
@@ -281,11 +291,14 @@
   }
 
   // 抓取某一状态的完整条目 id 列表（带翻页，兼容多种 URL 格式）
+  // 返回 { ids, expected, redirectedTo }；redirectedTo 非空表示页面被跳转到别的用户（避免误统计）
   async function fetchListIds(user, cfg, key) {
     var list = [];
     var seen = {};
     var bases = (cfg && cfg[key] && cfg[key].bases) || [];
     var pageDelay = 400;
+    var redirectedTo = null;
+    var wantUser = String(user || '').toLowerCase();
     for (var b = 0; b < bases.length; b++) {
       if (state.stopped) break;
       var page = 1;
@@ -295,6 +308,12 @@
         var html = '';
         try { html = await httpHtml(url); } catch (e) { html = ''; }
         if (!html) break;
+        // 校验：请求的是 user 的收藏，若被站点跳转到别的用户页面则放弃该 URL 格式
+        var gotUser = userFromListUrl(lastFetchedUrl);
+        if (gotUser && gotUser.toLowerCase() !== wantUser) {
+          redirectedTo = gotUser;
+          break;
+        }
         var found = extractSubjectIds(html);
         var added = 0;
         for (var i = 0; i < found.length; i++) {
@@ -308,9 +327,9 @@
         page++;
         await sleep(pageDelay);
       }
-      if (list.length) break; // 当前 URL 格式取到了条目，采用之
+      if (list.length || redirectedTo) break; // 取到条目 / 已确认跳转，都不再尝试其它格式
     }
-    return { ids: list, expected: (cfg && cfg[key]) ? cfg[key].expected : null };
+    return { ids: list, expected: (cfg && cfg[key]) ? cfg[key].expected : null, redirectedTo: redirectedTo };
   }
 
   // ---------------------------------------------------------------------------
@@ -443,6 +462,7 @@
       return;
     }
     settings.user = user;
+    state.runUser = user;
     settings.delay = Math.max(200, parseInt(dom.delayInput.value, 10) || 1100);
     settings.token = (dom.tokenInput ? dom.tokenInput.value : '').trim();
     settings.types = [];
@@ -468,7 +488,7 @@
     dom.btnStop.disabled = false;
     showProgress(true);
     showResults(false);
-    setLog('开始统计…');
+    setLog('开始统计…（统计对象：' + user + '）');
 
     var diskCache = loadDiskCache();
     var memCache = state.memoryCache;
@@ -481,11 +501,16 @@
       // 2) 抓取各状态下的条目 id
       var statusOf = {}; // id -> {collect:bool, do:bool}
       var unionSet = {};
+      var redirectWarn = null;
       for (var ti = 0; ti < settings.types.length; ti++) {
         var t = settings.types[ti];
         var label = t === 'collect' ? '看过' : '在看';
-        setLog('正在读取「' + label + '」列表…');
+        setLog('正在读取「' + label + '」列表…（统计对象：' + user + '）');
         var res = await fetchListIds(user, cfg, t);
+        if (res.redirectedTo) {
+          redirectWarn = res.redirectedTo;
+          continue; // 该状态页面被跳转到其他用户，跳过
+        }
         var ids = res.ids;
         state.lists[t] = ids;
         for (var i = 0; i < ids.length; i++) {
@@ -503,8 +528,13 @@
         await sleep(300);
       }
       var union = Object.keys(unionSet).map(Number);
+      if (redirectWarn) {
+        setLog('无法读取「' + user + '」的收藏：页面被跳转到 ' + redirectWarn +
+          '。请确认用户名拼写是否正确，或对方是否公开了动画收藏。', 'error');
+        return;
+      }
       if (!union.length) {
-        setLog('没有找到任何条目。请检查用户名是否正确、收藏列表是否公开。', 'error');
+        setLog('没有找到「' + user + '」的任何条目。请检查用户名是否正确、收藏列表是否公开。', 'error');
         return;
       }
 
@@ -642,6 +672,7 @@
 
     var html = '';
     html += '<div class="bgmss-summary">';
+    html += '<div class="chip" style="background:#eef4ff;border-color:#c7dbff;color:#1d4ed8;"><b>统计对象：</b>' + esc(state.runUser || settings.user) + '</div>';
     html += '<div class="chip"><b>' + totalRaw + '</b>去重条目（看过 ' + collectN + ' · 在看 ' + doN + '）</div>';
     html += '<div class="chip"><b>' + counted + '</b>部计入统计（TV 且有季度标签）</div>';
     html += '<div class="chip"><b>' + Object.keys(m).length + '</b>个季度</div>';
@@ -902,13 +933,16 @@
     try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
   }
 
-  // 自动把当前主页用户名填入面板（点击“启动”时调用）
+  // 自动把当前主页用户名填入面板（点击“启动”时调用；用户手动改过则不再覆盖）
   function applyProfileUser() {
     var u = currentProfileUser();
     if (!u) return false;
+    if (!dom.userInput) return false;
+    if (userEdited) return false;                       // 尊重手动输入的用户名
+    if (dom.userInput.value.trim() === u) return false; // 已是当前主页用户名
+    dom.userInput.value = u;
     settings.user = u;
     saveSettings();
-    if (dom.userInput) dom.userInput.value = u;
     return true;
   }
 
@@ -1011,7 +1045,9 @@
       state.stopped = true;
       setLog('正在停止（将在当前请求完成后停下）…', 'warn');
     });
+    dom.userInput.addEventListener('input', function () { userEdited = true; });
     dom.userInput.addEventListener('change', function () {
+      userEdited = true;
       settings.user = dom.userInput.value.trim() || DEFAULT_USER;
       saveSettings();
     });
