@@ -7,6 +7,8 @@
 // @match        *://bgm.tv/*
 // @match        *://bangumi.tv/*
 // @match        *://chii.in/*
+// @updateURL    https://raw.githubusercontent.com/Hyacince/bangumi-season-stats/main/bangumi-season-stats.user.js
+// @downloadURL  https://raw.githubusercontent.com/Hyacince/bangumi-season-stats/main/bangumi-season-stats.user.js
 // @grant        GM_xmlhttpRequest
 // @connect      api.bgm.tv
 // @run-at       document-end
