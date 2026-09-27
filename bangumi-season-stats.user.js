@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bangumi 季度番剧统计
 // @namespace    bgm-season-stats
-// @version      1.3.1
-// @description  统计 Bangumi 用户“看过/在看”收藏中 TV 动画的季度分布（依据条目标签中的 “xxxx年x月”，如 2025年1月；特殊开播月份归入所属季度：1-3月→1月季、4-6月→4月季、7-9月→7月季、10-12月→10月季），以柱状图直观展示每个季度看了多少部动画。入口为个人主页“加入”日期所在行的蓝色胶囊“季度番剧统计 + 启动”，点击后自动填入当前主页用户名，仅本用户主页显示。
+// @version      1.5.0
+// @description  统计 Bangumi 用户“看过/在看”收藏中 TV 动画：① 季度番剧统计（依据条目标签 “xxxx年x月”，只保留 1/4/7/10 月四季，特殊开播月份按所属季度归并）；② 追番/补番统计（收藏年份 ≤ 条目完结年份为追番，否则为补番），展示每年数量与比例。入口为个人主页“加入”日期所在行的蓝色胶囊“季度番剧统计 + 启动”，点击后自动填入当前主页用户名，仅本用户主页显示。
 // @author       dsh
 // @match        *://bgm.tv/*
 // @match        *://bangumi.tv/*
@@ -21,14 +21,15 @@
   // ---------------------------------------------------------------------------
   // 常量
   // ---------------------------------------------------------------------------
-  var VERSION = '1.3.1';
+  var VERSION = '1.5.0';
   var UA = (typeof navigator !== 'undefined' && navigator.userAgent) || 'Mozilla/5.0';
   // 季度标签：仅匹配 "xxxx年x月"（例如 2025年1月、2026年7月）
   var SEASON_RE = /^(\d{4})\s*年\s*(\d{1,2})\s*月$/;
   // 只统计 TV 动画。WEB / 剧场版 / OVA / 其它一律不统计。
   var INCLUDE_PLAT = { tv: 1 };
   var LS_SETTINGS = 'bgmSeasonStats.settings';
-  var LS_CACHE = 'bgmSeasonStats.cache.v2';
+  var LS_CACHE = 'bgmSeasonStats.cache.v4';
+  var LS_SNAPSHOT = 'bgmSeasonStats.snapshot.v1'; // 统计结果快照（跨页面/刷新保留）
   var CACHE_TTL = 7 * 24 * 3600 * 1000; // 条目详情本地缓存 7 天
   var MAX_LIST_PAGES = 300; // 每种收藏状态最多翻页数（安全上限）
   var MAX_DETAIL_RETRY = 4;
@@ -54,10 +55,18 @@
     skips: { web: 0, movie: 0, ova: 0, other: 0, noseason: 0, apiError: 0, unfetched: 0 },
     failStats: {},    // 失败原因 -> 数量，如 { "HTTP 404": 12, "timeout": 3 }
     failedList: [],   // [{id, reason}]
+    mode: 'season',   // 'season' 季度统计 | 'retire' 追番/补番统计
+    collTimes: {},    // id -> { y, m, d, src, type } 收藏时间
+    retire: { rows: [], kindCounts: {}, noTime: 0, noEnd: 0, unknown: 0 },
+    typeFilter: { tv: true, web: true, ova: true, movie: true, other: true }, // 追/补统计要显示的类型
+    lastTotalRaw: 0,
+    snapshotTs: 0,    // 当前展示结果对应的统计时间
     seasonMap: {}      // "2025-1" -> { year, month, count, items: [] }
   };
 
   var settings = loadSettings();
+  state.mode = settings.mode === 'retire' ? 'retire' : 'season';
+  if (settings.typeFilter) state.typeFilter = settings.typeFilter;
   var dom = {}; // 面板 DOM 引用
   var seasonOrder = []; // 渲染用：排序后的季度 key 列表
   var userEdited = false; // 用户是否手动修改过用户名（修改后不再被自动填入覆盖）
@@ -69,7 +78,9 @@
       user: typeof d.user === 'string' && d.user ? d.user : DEFAULT_USER,
       delay: typeof d.delay === 'number' ? d.delay : 1100,
       types: Array.isArray(d.types) ? d.types.filter(function (t) { return t === 'collect' || t === 'do'; }) : ['collect', 'do'],
-      token: typeof d.token === 'string' ? d.token : ''
+      token: typeof d.token === 'string' ? d.token : '',
+      mode: d.mode === 'retire' ? 'retire' : 'season',
+      typeFilter: (d.typeFilter && typeof d.typeFilter === 'object') ? d.typeFilter : { tv: true, web: true, ova: true, movie: true, other: true }
     };
   }
   function saveSettings() {
@@ -268,17 +279,32 @@
     return u + (u.indexOf('?') === -1 ? '?' : '&') + 'page=' + page;
   }
 
+  // 页签链接是否属于指定用户（避免误用页面里指向“我自己收藏”的链接）
+  function tabOwnerMatches(href, user, base) {
+    var abs = absUrlAgainst(href, base);
+    var owner = userFromListUrl(abs);
+    return !!owner && owner.toLowerCase() === String(user || '').toLowerCase();
+  }
+
   // 发现每种收藏状态可用的列表 URL。
-  // 优先级：页面“看过/在看”页签的真实链接 → 路径式 /anime/list/{user}/collect → 查询式 ?type=collect
+  // 只接受“属于该用户”的页签链接 → 路径式 /anime/list/{user}/collect → 查询式 ?type=collect
   async function discoverListConfig(user) {
-    var cfg = { collect: { bases: [], expected: null }, do: { bases: [], expected: null } };
+    var cfg = { collect: { bases: [], expected: null, ignoredTab: null }, do: { bases: [], expected: null, ignoredTab: null } };
     var qb = location.origin + '/anime/list/' + encodeURIComponent(user);
     var html = '';
     try { html = await httpHtml(qb); } catch (e) { html = ''; }
     var tabs = html ? parseTabInfo(html) : { collect: null, do: null, counts: {} };
     Object.keys(TYPE_LABELS).forEach(function (key) {
       var bases = [];
-      if (tabs[key]) bases.push(absUrlAgainst(tabs[key], qb));
+      var href = tabs[key];
+      if (href) {
+        if (tabOwnerMatches(href, user, qb)) {
+          bases.push(absUrlAgainst(href, qb));
+        } else {
+          // 该链接属于别的用户（通常是我自己的收藏），忽略并记录，避免统计错人
+          cfg[key].ignoredTab = userFromListUrl(absUrlAgainst(href, qb));
+        }
+      }
       bases.push(qb + '/' + key);
       bases.push(qb + '?type=' + key);
       var seen = {};
@@ -297,9 +323,11 @@
   async function fetchListIds(user, cfg, key) {
     var list = [];
     var seen = {};
+    var dates = {};
     var bases = (cfg && cfg[key] && cfg[key].bases) || [];
     var pageDelay = 400;
     var redirectedTo = null;
+    var usedBase = null;
     var wantUser = String(user || '').toLowerCase();
     for (var b = 0; b < bases.length; b++) {
       if (state.stopped) break;
@@ -317,6 +345,10 @@
           break;
         }
         var found = extractSubjectIds(html);
+        var pageDates = extractItemDates(html);
+        Object.keys(pageDates).forEach(function (k) {
+          if (!dates[k]) dates[k] = pageDates[k];
+        });
         var added = 0;
         for (var i = 0; i < found.length; i++) {
           if (!seen[found[i]]) {
@@ -326,12 +358,79 @@
           }
         }
         if (found.length === 0 || added === 0) break; // 翻到尽头 / 整页重复 / URL 格式无效
+        usedBase = bases[b];
         page++;
         await sleep(pageDelay);
       }
       if (list.length || redirectedTo) break; // 取到条目 / 已确认跳转，都不再尝试其它格式
     }
-    return { ids: list, expected: (cfg && cfg[key]) ? cfg[key].expected : null, redirectedTo: redirectedTo };
+    return {
+      ids: list,
+      dates: dates,
+      expected: (cfg && cfg[key]) ? cfg[key].expected : null,
+      redirectedTo: redirectedTo,
+      usedBase: usedBase,
+      ignoredTab: (cfg && cfg[key]) ? cfg[key].ignoredTab : null
+    };
+  }
+
+  // 从收藏列表页每个条目行里尽力解析“收藏日期”（行内日期文本）
+  function extractItemDates(html) {
+    var out = {};
+    try {
+      var doc = new DOMParser().parseFromString(html, 'text/html');
+      doc.querySelectorAll('li[id^="item_"]').forEach(function (li) {
+        var m = /^item_(\d+)$/.exec(li.id || '');
+        if (!m) return;
+        var text = (li.textContent || '').replace(/\s+/g, ' ');
+        var d = parseDateParts(text);
+        if (d) out[m[1]] = { y: d.y, m: d.m, d: d.d, src: 'list', type: null };
+      });
+    } catch (e) { /* ignore */ }
+    return out;
+  }
+
+  // 通过官方收藏接口读取收藏时间（需要访问令牌）；返回 {map:{id:{y,m,d,src,type}}, total} 或 null
+  async function fetchCollectionsViaApi(user) {
+    if (!settings.token) return null;
+    var map = {};
+    var total = null;
+    var limit = 50;
+    var types = [2, 3]; // 2=看过 3=在看
+    for (var ti = 0; ti < types.length; ti++) {
+      var offset = 0;
+      while (true) {
+        if (state.stopped) break;
+        var url = 'https://api.bgm.tv/v0/users/' + encodeURIComponent(user) +
+          '/collections?subject_type=2&type=' + types[ti] + '&limit=' + limit + '&offset=' + offset;
+        var r = null;
+        try { r = await gmGet(url); } catch (e) { return null; }
+        if (!r || r.status !== 200) return null;
+        var json = null;
+        try { json = JSON.parse(r.responseText); } catch (e) { return null; }
+        if (typeof json.total === 'number' && total === null) total = json.total;
+        var data = json.data || [];
+        for (var i = 0; i < data.length; i++) {
+          var it = data[i];
+          var sid = it.subject_id;
+          if (!sid) continue;
+          var raw = it.created_at || it.updated_at || '';
+          var parts = parseDateParts(raw);
+          map[sid] = {
+            y: parts ? parts.y : null,
+            m: parts ? parts.m : null,
+            d: parts ? parts.d : null,
+            src: it.created_at ? 'created_at' : 'updated_at',
+            type: it.type
+          };
+        }
+        offset += data.length;
+        if (!data.length) break;
+        if (typeof json.total === 'number' && offset >= json.total) break;
+        await sleep(250);
+      }
+    }
+    return { map: map, total: total };
   }
 
   // ---------------------------------------------------------------------------
@@ -367,27 +466,63 @@
     throw lastErr || new Error('fetch failed');
   }
 
-  // 分析一条目：判定平台类型 + 季度标签
+  // 解析 2025年3月28日 / 2025-03-28 / 2025/3/28 / 2025-03 等日期，返回 {y,m,d}
+  function parseDateParts(s) {
+    if (!s) return null;
+    var str = String(s);
+    var m = /(\d{4})\s*[-\/年.]\s*(\d{1,2})\s*[-\/月.]\s*(\d{1,2})/.exec(str);
+    if (m) return { y: parseInt(m[1], 10), m: parseInt(m[2], 10), d: parseInt(m[3], 10) };
+    m = /(\d{4})\s*[-\/年.]\s*(\d{1,2})/.exec(str);
+    if (m) return { y: parseInt(m[1], 10), m: parseInt(m[2], 10), d: 1 };
+    m = /(\d{4})/.exec(str);
+    if (m) return { y: parseInt(m[1], 10), m: 0, d: 0 };
+    return null;
+  }
+
+  // 从条目 infobox 中取“放送结束 / 完结”时间（用于判断完结年份）
+  function extractEndDate(json) {
+    var ib = Array.isArray(json.infobox) ? json.infobox : [];
+    for (var i = 0; i < ib.length; i++) {
+      var key = String(ib[i].key || '');
+      if (key.indexOf('结束') === -1 && key.indexOf('完结') === -1) continue;
+      var val = ib[i].value;
+      var text = '';
+      if (typeof val === 'string') {
+        text = val;
+      } else if (Array.isArray(val)) {
+        for (var j = 0; j < val.length; j++) {
+          var v = val[j];
+          text += ((v && typeof v === 'object') ? String(v.v || v.k || '') : String(v == null ? '' : v)) + ' ';
+        }
+      } else if (val && typeof val === 'object') {
+        text = String(val.v || val.k || '');
+      }
+      var d = parseDateParts(text);
+      if (d) return d;
+    }
+    return null;
+  }
+
+  // 平台归类（追/补统计会用到全部类型；季度统计只取 TV）
+  var PLAT_LABELS = { tv: 'TV', web: 'WEB', ova: 'OVA/OAD', movie: '剧场版', other: '其它' };
+  function platformKind(platform) {
+    var p = String(platform || '').toLowerCase().replace(/\s+/g, '');
+    if (p === 'tv') return 'tv';
+    if (p.indexOf('web') !== -1) return 'web';
+    if (p.indexOf('ova') !== -1 || p.indexOf('oad') !== -1) return 'ova';
+    if (p.indexOf('剧场版') !== -1 || p.indexOf('movie') !== -1 || p.indexOf('电影') !== -1) return 'movie';
+    return 'other';
+  }
+
+  // 分析一条目：平台类型 + 季度标签（可空）+ 完结年份
   function analyzeSubject(json) {
     var out = { skip: null, subject: null, season: null };
     if (!json || json.type !== 2) { // 非动画
       out.skip = 'other';
       return out;
     }
-    var platform = String(json.platform || '').toLowerCase().replace(/\s+/g, '');
-    if (!INCLUDE_PLAT[platform]) {
-      if (platform.indexOf('web') !== -1) {
-        out.skip = 'web';
-      } else if (platform.indexOf('剧场版') !== -1 || platform.indexOf('movie') !== -1 || platform.indexOf('电影') !== -1) {
-        out.skip = 'movie';
-      } else if (platform.indexOf('ova') !== -1 || platform.indexOf('oad') !== -1) {
-        out.skip = 'ova';
-      } else {
-        out.skip = 'other';
-      }
-      return out;
-    }
-    // 平台为 TV：寻找季度标签 "xxxx年x月"，特殊月份归入所属季度（1/4/7/10月）
+    var kind = platformKind(json.platform);
+    // 寻找季度标签 "xxxx年x月"，特殊月份归入所属季度（1/4/7/10月）；标签可为空（追/补统计不需要）
     var season = null;
     var tags = Array.isArray(json.tags) ? json.tags : [];
     for (var i = 0; i < tags.length; i++) {
@@ -397,16 +532,23 @@
         break;
       }
     }
-    if (!season) {
-      out.skip = 'noseason';
-      return out;
-    }
+    var endParts = extractEndDate(json);
+    var startParts = parseDateParts(json.date || '');
+    // 完结年份：优先 infobox 的“放送结束/完结”，否则退回季度标签年份，再退回放送开始年份
+    var endYear = null;
+    if (endParts) endYear = endParts.y;
+    else if (season) endYear = season.year;
+    else if (startParts) endYear = startParts.y;
     out.subject = {
       id: json.id,
       name: json.name || '',
       nameCn: json.name_cn || '',
       platform: String(json.platform || ''),
+      platKind: kind,
       date: json.date || '',
+      startParts: startParts,
+      endParts: endParts,
+      endYear: endYear,
       type: json.type
     };
     out.season = season;
@@ -439,9 +581,92 @@
   function cacheUsable(c) {
     if (!c) return false;
     if (c.skip === 'apiError') return false;
-    if (c.subject && c.season) return true;
-    if (c.skip) return true; // 已判定的跳过结果（剧场版/OVA/无标签等）
+    if (c.subject) return true;   // 已成功解析（TV；season 可能为空，追/补统计仍可用）
+    if (c.skip) return true;      // 已判定的跳过结果（WEB/剧场版/OVA 等）
     return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 结果快照：统计一次后保存，之后打开面板/切换页面直接显示，直到手动更新
+  // ---------------------------------------------------------------------------
+  function loadSnapshots() {
+    try {
+      var raw = localStorage.getItem(LS_SNAPSHOT);
+      return raw ? (JSON.parse(raw) || {}) : {};
+    } catch (e) { return {}; }
+  }
+
+  function formatTs(ts) {
+    var d = new Date(ts);
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  function saveSnapshot() {
+    var all = loadSnapshots();
+    all[state.mode] = {
+      ts: Date.now(),
+      mode: state.mode,
+      user: state.runUser || settings.user,
+      lists: state.lists || {},
+      skips: state.skips || {},
+      failStats: state.failStats || {},
+      failedList: state.failedList || [],
+      seasonMap: state.mode === 'season' ? state.seasonMap : null,
+      retire: state.mode === 'retire' ? state.retire : null,
+      totalRaw: state.lastTotalRaw || 0
+    };
+    try {
+      localStorage.setItem(LS_SNAPSHOT, JSON.stringify(all));
+    } catch (e) {
+      setLog('结果保存失败（浏览器存储空间不足），本次结果仅在当前页面可见。', 'warn');
+    }
+  }
+
+  function clearSnapshot() {
+    try { localStorage.removeItem(LS_SNAPSHOT); } catch (e) { /* ignore */ }
+    state.snapshotTs = 0;
+    if (dom.results) {
+      dom.results.innerHTML = '';
+      dom.results.style.display = 'none';
+    }
+    setLog('已清除保存的统计结果（下次打开需重新点击“开始统计”）。', 'ok');
+  }
+
+  // 恢复指定模式的快照并渲染；无快照返回 false
+  function restoreSnapshot(mode) {
+    var snap = loadSnapshots()[mode];
+    if (!snap || !snap.ts) return false;
+    state.lists = snap.lists || {};
+    state.skips = snap.skips || { web: 0, movie: 0, ova: 0, other: 0, noseason: 0, apiError: 0, unfetched: 0 };
+    state.failStats = snap.failStats || {};
+    state.failedList = snap.failedList || [];
+    state.runUser = snap.user || settings.user;
+    state.lastTotalRaw = snap.totalRaw || 0;
+    state.snapshotTs = snap.ts;
+    if (mode === 'season') {
+      state.seasonMap = snap.seasonMap || {};
+      seasonOrder = Object.keys(state.seasonMap).sort(function (a, b) {
+        var A = a.split('-'), B = b.split('-');
+        return (parseInt(A[0], 10) - parseInt(B[0], 10)) || (parseInt(A[1], 10) - parseInt(B[1], 10));
+      });
+      renderResults(state.lastTotalRaw, true);
+    } else {
+      state.retire = snap.retire || { rows: [], kindCounts: {}, noTime: 0, noEnd: 0, unknown: 0 };
+      renderRetire(state.lastTotalRaw, true);
+    }
+    return true;
+  }
+
+  function snapshotBanner(restored) {
+    if (!state.snapshotTs) return '';
+    var when = formatTs(state.snapshotTs);
+    var who = esc(state.runUser || settings.user);
+    var color = restored ? '#f6f8fb' : '#f0fff4';
+    var note = restored
+      ? '这是上次保存的结果，点击「▶ 开始统计」可更新数据'
+      : '本次统计完成';
+    return '<div class="bgmss-block" style="padding:7px 12px;background:' + color + ';border-color:#e3e9f2;color:#555;font-size:12px;">' +
+      '🕒 ' + when + ' · 统计对象：<b>' + who + '</b> · ' + note + '</div>';
   }
 
   // ---------------------------------------------------------------------------
@@ -490,7 +715,7 @@
     dom.btnStop.disabled = false;
     showProgress(true);
     showResults(false);
-    setLog('开始统计…（统计对象：' + user + '）');
+    setLog('开始统计…（统计对象：' + user + '，模式：' + (state.mode === 'retire' ? '追番/补番' : '季度') + '）');
 
     var diskCache = loadDiskCache();
     var memCache = state.memoryCache;
@@ -500,10 +725,38 @@
       setLog('正在读取收藏列表页…');
       var cfg = await discoverListConfig(user);
 
-      // 2) 抓取各状态下的条目 id
+      // 1.1) 若填的是数字 UID，部分情况下站点会跳到以用户名为准的地址：跟随一次
+      var probeOwner = userFromListUrl(lastFetchedUrl);
+      if (probeOwner && /^\d+$/.test(user) && probeOwner.toLowerCase() !== user.toLowerCase()) {
+        setLog('已将 UID ' + user + ' 解析为用户名：' + probeOwner);
+        user = probeOwner;
+        state.runUser = user;
+        settings.user = user;
+        dom.userInput.value = user;
+        saveSettings();
+        cfg = await discoverListConfig(user);
+      }
+
+      // 2) 抓取各状态下的条目 id（追/补模式优先用官方收藏接口，可同时拿到收藏时间）
+      var runMode = state.mode;
       var statusOf = {}; // id -> {collect:bool, do:bool}
       var unionSet = {};
       var redirectWarn = null;
+      state.collTimes = {};
+      var apiColl = null;
+      if (runMode === 'retire') {
+        if (settings.token) {
+          setLog('正在通过收藏接口读取收藏时间…');
+          apiColl = await fetchCollectionsViaApi(user);
+          if (apiColl) {
+            setLog('收藏接口返回 ' + Object.keys(apiColl.map).length + ' 条（含收藏时间）');
+          } else {
+            setLog('收藏接口不可用（可能令牌无效/权限不足），改为从列表页解析日期。', 'warn');
+          }
+        } else {
+          setLog('未填访问令牌：将从收藏列表页尽力解析日期；若结果多为“无法判断”，建议在 bgm.tv/dev/app 创建令牌填入。', 'warn');
+        }
+      }
       for (var ti = 0; ti < settings.types.length; ti++) {
         var t = settings.types[ti];
         var label = t === 'collect' ? '看过' : '在看';
@@ -513,6 +766,9 @@
           redirectWarn = res.redirectedTo;
           continue; // 该状态页面被跳转到其他用户，跳过
         }
+        if (res.ignoredTab) {
+          setLog('提示：页面中「' + label + '」页签指向 ' + res.ignoredTab + '（不是 ' + user + '），已忽略并改用 /anime/list/' + user + '/…。', 'warn');
+        }
         var ids = res.ids;
         state.lists[t] = ids;
         for (var i = 0; i < ids.length; i++) {
@@ -521,18 +777,40 @@
           statusOf[id][t] = true;
           unionSet[id] = true;
         }
+        // 未拿到接口数据时，用列表页行内日期作为收藏时间
+        if (runMode === 'retire' && !apiColl && res.dates) {
+          Object.keys(res.dates).forEach(function (k) {
+            if (!state.collTimes[k]) state.collTimes[k] = res.dates[k];
+          });
+        }
         if (res.expected && ids.length && Math.abs(ids.length - res.expected) > Math.max(5, Math.round(res.expected * 0.1))) {
           setLog('警告：「' + label + '」抓到 ' + ids.length + ' 条，与页面标注的 ' + res.expected +
             ' 条差异较大，可能存在漏抓（可截图反馈以排查）。', 'warn');
         } else {
-          setLog('「' + label + '」共 ' + ids.length + ' 条' + (res.expected ? '（页面标注 ' + res.expected + ' 条）' : ''));
+          setLog('「' + label + '」共 ' + ids.length + ' 条' +
+            (res.expected ? '（页面标注 ' + res.expected + ' 条）' : '') +
+            (res.usedBase ? '（来源 ' + res.usedBase.replace(location.origin, '') + '）' : ''));
         }
         await sleep(300);
       }
+      // 追/补模式若拿到了收藏接口数据，则以接口为准（同时校正状态）
+      if (runMode === 'retire' && apiColl) {
+        statusOf = {};
+        unionSet = {};
+        Object.keys(apiColl.map).forEach(function (k) {
+          var rec = apiColl.map[k];
+          var t2 = rec.type === 2 ? 'collect' : (rec.type === 3 ? 'do' : null);
+          if (!t2 || settings.types.indexOf(t2) === -1) return;
+          statusOf[k] = {};
+          statusOf[k][t2] = true;
+          unionSet[k] = true;
+          state.collTimes[k] = rec;
+        });
+      }
       var union = Object.keys(unionSet).map(Number);
-      if (redirectWarn) {
-        setLog('无法读取「' + user + '」的收藏：页面被跳转到 ' + redirectWarn +
-          '。请确认用户名拼写是否正确，或对方是否公开了动画收藏。', 'error');
+      if (redirectWarn && !union.length) {
+        setLog('无法读取「' + user + '」的收藏：请求 /anime/list/' + user +
+          ' 时被站点跳转到了 ' + redirectWarn + '。请确认用户名拼写是否正确，或该用户的动画收藏是否公开。', 'error');
         return;
       }
       if (!union.length) {
@@ -577,13 +855,21 @@
         await sleep(settings.delay);
       }
 
-      // 4) 汇总统计
+      // 4) 汇总统计（按当前模式渲染）
       if (state.stopped) {
         setLog('已停止（完成 ' + state.processed + '/' + needFetch.length + ' 条详情抓取）。未抓取部分不参与统计。', 'warn');
         if (!union.length) return;
       }
-      buildStats(statusOf, diskCache, memCache);
-      renderResults(union.length);
+      state.lastTotalRaw = union.length;
+      state.snapshotTs = Date.now();
+      if (runMode === 'retire') {
+        buildRetireStats(statusOf, diskCache, memCache);
+        renderRetire(state.lastTotalRaw, false);
+      } else {
+        buildStats(statusOf, diskCache, memCache);
+        renderResults(state.lastTotalRaw, false);
+      }
+      saveSnapshot(); // 保存结果，之后打开面板/切换页面可直接查看
       flushCacheToDisk(memCache);
     } catch (e) {
       console.error('[BGM季度统计]', e);
@@ -617,8 +903,16 @@
     var missing = 0;
     Object.keys(statusOf).forEach(function (id) {
       var cached = memCache[id] || diskCache[id] || null;
-      if (cached && cached.subject && cached.season) {
+      if (cached && cached.subject && cached.subject.platKind === 'tv' && cached.season) {
         byId[id] = { subject: cached.subject, season: cached.season, status: statusOf[id] };
+      } else if (cached && cached.subject) {
+        // 季度统计只保留 TV：其它平台或 TV 无季度标签分别计数
+        var pk = cached.subject.platKind || 'other';
+        if (pk === 'tv') state.skips.noseason++;
+        else if (pk === 'web') state.skips.web++;
+        else if (pk === 'movie') state.skips.movie++;
+        else if (pk === 'ova') state.skips.ova++;
+        else state.skips.other++;
       } else if (cached && cached.skip) {
         state.skips[cached.skip] = (state.skips[cached.skip] || 0) + 1;
       } else {
@@ -660,9 +954,304 @@
   }
 
   // ---------------------------------------------------------------------------
-  // 渲染
+  // 追番 / 补番 汇总（完结年份 vs 收藏年份；收藏年份 <= 完结年份 → 追番，否则补番）
+  // 收录全部动画类型（TV/WEB/OVA/剧场版/其它），由用户在结果页勾选要显示的类型
   // ---------------------------------------------------------------------------
-  function renderResults(totalRaw) {
+  function buildRetireStats(statusOf, diskCache, memCache) {
+    var rows = [];
+    var kindCounts = { tv: 0, web: 0, ova: 0, movie: 0, other: 0 };
+    var noTime = 0, noEnd = 0, unknown = 0;
+
+    Object.keys(statusOf).forEach(function (id) {
+      var cached = memCache[id] || diskCache[id] || null;
+      if (!cached) { unknown++; return; }
+      if (!cached.subject) {
+        if (cached.skip) state.skips[cached.skip] = (state.skips[cached.skip] || 0) + 1;
+        else unknown++;
+        return;
+      }
+      var subj = cached.subject;
+      var pk = subj.platKind || 'other';
+      kindCounts[pk] = (kindCounts[pk] || 0) + 1;
+
+      var endYear = subj.endYear || null;
+      var ct = state.collTimes[id] || null;
+      var hasTime = !!(ct && ct.y);
+      var valid = !!(endYear && hasTime);
+      if (!endYear) noEnd++;
+      if (!hasTime) noTime++;
+      if (!valid) unknown++;
+
+      var st = [];
+      if (statusOf[id] && statusOf[id].collect) st.push('看过');
+      if (statusOf[id] && statusOf[id].do) st.push('在看');
+
+      var collDate = hasTime ? (ct.m ? (ct.y + '-' + pad(ct.m) + '-' + pad(ct.d && ct.d > 0 ? ct.d : 1)) : String(ct.y)) : '';
+      rows.push({
+        id: id,
+        platKind: pk,
+        platLabel: PLAT_LABELS[pk] || pk,
+        valid: valid,
+        kind: valid ? ((ct.y <= endYear) ? 'zhui' : 'bui') : null,
+        kindLabel: valid ? ((ct.y <= endYear) ? '追番' : '补番') : '无法判断',
+        year: hasTime ? ct.y : null,
+        title: subj.nameCn || subj.name || ('#' + id),
+        name: subj.name || '',
+        platform: subj.platform || '',
+        status: st.join(' / ') || '?',
+        endYear: endYear,
+        endEstimated: !subj.endParts,
+        endDate: subj.endParts
+          ? (subj.endParts.y + '-' + pad(subj.endParts.m) + '-' + pad(subj.endParts.d))
+          : ((subj.date || '') + (subj.date ? '（估）' : '')),
+        startDate: subj.date || '',
+        collDate: collDate,
+        collSrc: ct && ct.src ? ct.src : '',
+        url: 'https://bgm.tv/subject/' + id
+      });
+    });
+
+    state.retire = { rows: rows, kindCounts: kindCounts, noTime: noTime, noEnd: noEnd, unknown: unknown };
+  }
+
+  // 按用户勾选的类型过滤
+  function retireFilteredRows() {
+    var f = state.typeFilter || {};
+    return (state.retire.rows || []).filter(function (r) {
+      return f[r.platKind] !== false;
+    });
+  }
+
+  // 由过滤后的行生成“年份 -> {追/补}”桶
+  function retireYearBuckets(rows) {
+    var years = {};
+    rows.forEach(function (r) {
+      if (!r.valid) return;
+      var y = r.year;
+      if (!years[y]) years[y] = { year: y, zhui: 0, bui: 0, total: 0, items: [] };
+      years[y][r.kind]++;
+      years[y].total++;
+      years[y].items.push(r);
+    });
+    return years;
+  }
+
+  function renderRetire(totalRaw, restored) {
+    showResults(true);
+    state.wasRestored = !!restored;
+    var rows = retireFilteredRows();
+    var valid = rows.filter(function (r) { return r.valid; });
+    var invalid = rows.length - valid.length;
+    var zhui = 0, bui = 0;
+    valid.forEach(function (r) { if (r.kind === 'zhui') zhui++; else bui++; });
+    var known = zhui + bui;
+    var pctZ = known ? Math.round((zhui / known) * 1000) / 10 : 0;
+    var pctB = known ? Math.round((bui / known) * 1000) / 10 : 0;
+
+    var html = snapshotBanner(!!restored);
+    html += '<div class="bgmss-summary">';
+    html += '<div class="chip" style="background:#eef4ff;border-color:#c7dbff;color:#1d4ed8;"><b>统计对象：</b>' + esc(state.runUser || settings.user) + '</div>';
+    html += '<div class="chip"><b>' + valid.length + '</b>部可判断</div>';
+    html += '<div class="chip" style="background:#eaf1ff;border-color:#bcd3ff;color:#1b4fd8;"><b>' + zhui + '</b>追番（' + pctZ + '%）</div>';
+    html += '<div class="chip" style="background:#fff4e6;border-color:#ffd8a8;color:#a35b00;"><b>' + bui + '</b>补番（' + pctB + '%）</div>';
+    if (invalid) html += '<div class="chip warn-chip">无法判断 ' + invalid + '（当前筛选内）</div>';
+    html += '</div>';
+
+    html += renderTypeFilter();
+
+    if (!known) {
+      html += '<p class="bgmss-empty">当前类型筛选下无法计算追番/补番数据。<br>' +
+        '· 若“缺收藏时间”较多：请填入 bgm.tv 个人访问令牌（用于读取收藏时间）；<br>' +
+        '· 若“缺完结时间”较多：说明条目信息里没有“放送结束/完结”日期；<br>' +
+        '· 也可以在上方勾选其它动画类型看看。</p>';
+    } else {
+      var years = retireYearBuckets(valid);
+      html += renderRetireChart(years);
+      html += renderRetireTable(years);
+      html += renderRetireDetail(years);
+    }
+    html += renderFooter((state.lists.collect || []).length, (state.lists.do || []).length);
+    dom.results.innerHTML = html;
+    bindRetireEvents();
+  }
+
+  // 类型多选筛选（统计后由用户决定显示哪些类型）
+  function renderTypeFilter() {
+    var counts = (state.retire && state.retire.kindCounts) || {};
+    var f = state.typeFilter || {};
+    var order = ['tv', 'web', 'ova', 'movie', 'other'];
+    var html = '<div class="bgmss-block" style="padding:8px 12px;"><span style="color:#666;margin-right:8px;">显示类型（可多选）：</span>';
+    order.forEach(function (k) {
+      var n = counts[k] || 0;
+      if (!n) return;
+      html += '<label class="bgmss-typechk"><input type="checkbox" data-kind="' + k + '"' +
+        (f[k] === false ? '' : ' checked') + '> ' + esc(PLAT_LABELS[k] || k) + '（' + n + '）</label>';
+    });
+    var noTimeN = (state.retire && state.retire.noTime) || 0;
+    var noEndN = (state.retire && state.retire.noEnd) || 0;
+    html += '<span class="muted" style="font-size:11px;color:#999;margin-left:8px;">全部条目中：缺收藏时间 ' + noTimeN + ' · 缺完结时间 ' + noEndN + '</span>';
+    html += '</div>';
+    return html;
+  }
+
+  function renderRetireChart(years) {
+    var yearKeys = Object.keys(years).map(Number).sort(function (a, b) { return a - b; });
+    var maxTotal = 1;
+    yearKeys.forEach(function (y) { if (years[y].total > maxTotal) maxTotal = years[y].total; });
+
+    var html = '<div class="bgmss-block"><div class="bgmss-block-title">📊 每年追番 / 补番数量（按收藏年份） <span class="tip">（点击柱子查看该年明细）</span></div>';
+    html += '<div class="bgmss-scroll"><div class="bgmss-bars">';
+    for (var i = 0; i < yearKeys.length; i++) {
+      var y = yearKeys[i];
+      var d = years[y];
+      var H = Math.max(8, Math.round((d.total / maxTotal) * 170));
+      var hZ = d.total ? Math.round(H * (d.zhui / d.total)) : 0;
+      var hB = H - hZ;
+      var rate = d.total ? Math.round((d.zhui / d.total) * 1000) / 10 : 0;
+      var tip = y + ' 年：共 ' + d.total + ' 部\n追番 ' + d.zhui + ' 部 · 补番 ' + d.bui + ' 部\n追番比例 ' + rate + '%';
+      html += '<div class="bgmss-yearblock">';
+      html += '<div class="bgmss-yearlabel">' + y + ' 年</div>';
+      html += '<div class="bgmss-yearbars">';
+      html += '<div class="bgmss-col" data-year="' + y + '" title="' + esc(tip) + '">';
+      html += '<div class="bgmss-count">' + d.total + '</div>';
+      html += '<div class="bgmss-stack" style="height:' + H + 'px">';
+      if (hB > 0) html += '<div class="bgmss-seg seg-bui" style="height:' + hB + 'px">' + (hB >= 14 ? d.bui : '') + '</div>';
+      if (hZ > 0) html += '<div class="bgmss-seg seg-zhui" style="height:' + hZ + 'px">' + (hZ >= 14 ? d.zhui : '') + '</div>';
+      html += '</div>';
+      html += '<div class="bgmss-xlabel">追 ' + rate + '%</div>';
+      html += '</div>';
+      html += '</div></div>';
+    }
+    html += '</div></div>';
+    html += '<div class="bgmss-legend">' +
+      '<span class="lg"><i style="background:#2f6fdb"></i>追番（收藏年份 ≤ 完结年份）</span>' +
+      '<span class="lg"><i style="background:#f2a33c"></i>补番（收藏年份 &gt; 完结年份）</span>' +
+      '</div></div>';
+    return html;
+  }
+
+  function renderRetireTable(years) {
+    var yearKeys = Object.keys(years).map(Number).sort(function (a, b) { return a - b; });
+    var html = '<div class="bgmss-block"><div class="bgmss-block-title">📋 年度汇总</div>';
+    html += '<table class="bgmss-table"><thead><tr><th>收藏年份</th><th>追番</th><th>补番</th><th>合计</th><th>追番比例</th></tr></thead><tbody>';
+    var sumZ = 0, sumB = 0;
+    yearKeys.forEach(function (y) {
+      var d = years[y];
+      sumZ += d.zhui; sumB += d.bui;
+      var rate = d.total ? Math.round((d.zhui / d.total) * 1000) / 10 : 0;
+      html += '<tr><td>' + y + ' 年</td><td>' + d.zhui + '</td><td>' + d.bui + '</td><td>' + d.total + '</td><td>' + rate + '%</td></tr>';
+    });
+    var sumRate = (sumZ + sumB) ? Math.round((sumZ / (sumZ + sumB)) * 1000) / 10 : 0;
+    html += '<tr style="font-weight:bold;background:#f6f8fb;"><td>合计</td><td>' + sumZ + '</td><td>' + sumB + '</td><td>' + (sumZ + sumB) + '</td><td>' + sumRate + '%</td></tr>';
+    html += '</tbody></table></div>';
+    return html;
+  }
+
+  function renderRetireDetail(years) {
+    var yearKeys = Object.keys(years).map(Number).sort(function (a, b) { return b - a; });
+    var opts = yearKeys.map(function (y) {
+      var d = years[y];
+      return '<option value="' + y + '">' + y + ' 年（追 ' + d.zhui + ' · 补 ' + d.bui + '）</option>';
+    }).join('');
+    return '<div class="bgmss-block"><div class="bgmss-block-title">📋 年度作品明细</div>' +
+      '<select id="bgmss-yearSel">' + opts + '</select>' +
+      '<div id="bgmss-yearList"></div></div>';
+  }
+
+  function renderYearList(years, year) {
+    var d = years[year];
+    if (!d) return '';
+    var html = '<table class="bgmss-table"><thead><tr><th>标题</th><th>原名</th><th>平台</th><th>类型</th><th>完结年</th><th>收藏日期</th><th>状态</th></tr></thead><tbody>';
+    d.items.slice().sort(function (a, b) {
+      if (a.kind !== b.kind) return a.kind === 'zhui' ? -1 : 1;
+      return a.title.localeCompare(b.title, 'zh');
+    }).forEach(function (it) {
+      var color = it.kind === 'zhui' ? '#2f6fdb' : '#a35b00';
+      html += '<tr><td><a href="' + esc(it.url) + '" target="_blank" rel="noopener">' + esc(it.title) + '</a></td>' +
+        '<td class="muted">' + esc(it.name) + '</td>' +
+        '<td>' + esc(it.platLabel || it.platform) + '</td>' +
+        '<td style="color:' + color + ';white-space:nowrap;">' + esc(it.kindLabel) + '</td>' +
+        '<td>' + esc(String(it.endYear)) + (it.endEstimated ? '<span class="muted" title="条目信息里没有“放送结束”，按季度/开播年份估算">*</span>' : '') + '</td>' +
+        '<td style="white-space:nowrap;" title="' + esc(it.collSrc ? ('来源：' + it.collSrc) : '') + '">' + esc(it.collDate) + '</td>' +
+        '<td>' + esc(it.status) + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    return html;
+  }
+
+  function bindRetireEvents() {
+    // 类型多选筛选：改变后仅重绘结果，不重新抓取
+    document.querySelectorAll('input[data-kind]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var k = cb.getAttribute('data-kind');
+        if (!state.typeFilter) state.typeFilter = {};
+        state.typeFilter[k] = cb.checked;
+        settings.typeFilter = state.typeFilter;
+        saveSettings();
+        renderRetire(state.lastTotalRaw || 0, !!state.wasRestored);
+      });
+    });
+    document.querySelectorAll('.bgmss-col[data-year]').forEach(function (el2) {
+      el2.addEventListener('click', function () {
+        var y = el2.getAttribute('data-year');
+        var sel = document.getElementById('bgmss-yearSel');
+        if (sel && sel.querySelector('option[value="' + y + '"]')) {
+          sel.value = y;
+          sel.dispatchEvent(new Event('change'));
+        }
+        var listEl = document.getElementById('bgmss-yearList');
+        if (listEl) listEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
+    });
+    var sel = document.getElementById('bgmss-yearSel');
+    if (sel) {
+      var render = function () {
+        var listEl = document.getElementById('bgmss-yearList');
+        if (listEl) listEl.innerHTML = renderYearList(retireYearBuckets(retireFilteredRows().filter(function (r) { return r.valid; })), sel.value);
+      };
+      sel.addEventListener('change', render);
+      render();
+    }
+    var exp = document.getElementById('bgmss-export');
+    if (exp) exp.addEventListener('click', exportRetireCSV);
+    var expf = document.getElementById('bgmss-export-fail');
+    if (expf) expf.addEventListener('click', exportFailCSV);
+    var cp = document.getElementById('bgmss-copy');
+    if (cp) cp.addEventListener('click', copySummary);
+    var snap = document.getElementById('bgmss-snapshot-clear');
+    if (snap) snap.addEventListener('click', clearSnapshot);
+    var cc = document.getElementById('bgmss-cache-clear');
+    if (cc) cc.addEventListener('click', function () {
+      try { localStorage.removeItem(LS_CACHE); } catch (e) { /* ignore */ }
+      setLog('已清除条目缓存，下次运行将重新获取详情。', 'ok');
+    });
+  }
+
+  function exportRetireCSV() {
+    var rows = [['收藏年份', '类型', '标题', '原名', '平台', '状态', '完结年份', '完结日期', '收藏日期', '收藏时间来源', '条目链接']];
+    retireFilteredRows().slice().sort(function (a, b) {
+      return ((a.year || 0) - (b.year || 0)) || (a.kind === b.kind ? 0 : (a.kind === 'zhui' ? -1 : 1));
+    }).forEach(function (it) {
+      rows.push([it.year || '', it.kindLabel, it.title, it.name, it.platLabel || it.platform, it.status, it.endYear || '', it.endDate, it.collDate, it.collSrc, it.url]);
+    });
+    var csv = rows.map(function (r) {
+      return r.map(function (v) {
+        v = String(v == null ? '' : v);
+        return '"' + v.replace(/"/g, '""') + '"';
+      }).join(',');
+    }).join('\r\n');
+    var blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'bangumi-retire-stats.csv';
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+  }
+
+  // ---------------------------------------------------------------------------
+  // 渲染（季度统计）
+  // ---------------------------------------------------------------------------
+  function renderResults(totalRaw, restored) {
     showResults(true);
     var m = state.seasonMap;
     var counted = 0;
@@ -672,7 +1261,7 @@
     var doN = (state.lists.do || []).length;
     var sk = state.skips;
 
-    var html = '';
+    var html = snapshotBanner(!!restored);
     html += '<div class="bgmss-summary">';
     html += '<div class="chip" style="background:#eef4ff;border-color:#c7dbff;color:#1d4ed8;"><b>统计对象：</b>' + esc(state.runUser || settings.user) + '</div>';
     html += '<div class="chip"><b>' + totalRaw + '</b>去重条目（看过 ' + collectN + ' · 在看 ' + doN + '）</div>';
@@ -783,16 +1372,25 @@
     if (state.failedList && state.failedList.length) {
       html += '<button id="bgmss-export-fail" class="danger">⛔ 导出失败清单(' + state.failedList.length + ')</button>';
     }
+    if (state.snapshotTs) {
+      html += '<button id="bgmss-snapshot-clear" class="danger">🧹 清除已保存结果</button>';
+    }
     html += '<button id="bgmss-cache-clear" class="danger">🗑 清除条目缓存</button>' +
       '</div>';
-    html += '<div class="bgmss-note">统计口径：仅「看过 / 在看」中的 动画(TV)，按条目“标签”里的 “xxxx年x月” 判定季度，只保留 1/4/7/10 月四季；' +
-      '开播时间特殊的月份（如 2月、11月）自动归入其所属季度（1-3月→1月季、4-6月→4月季、7-9月→7月季、10-12月→10月季）。' +
-      '剧场版 / OVA / WEB / 其它平台、以及没有该格式季度标签的条目不计入。数据只读，不会修改你的收藏。';
-    if (state.skips.apiError) {
-      html += '<br>提示：API 获取失败多为 <b>404</b>（最常见是 <b>R18 条目</b>——R18 仅注册满两个月且带认证的账号可访问，匿名请求返回 404；' +
-        '也可能是被合并/删除的条目）。可在 bgm.tv/dev/app 创建“个人访问令牌”填入面板，脚本会带认证重读；用“导出失败清单”核对具体条目。';
+    if (state.mode === 'retire') {
+      html += '<div class="bgmss-note">统计口径：仅「看过 / 在看」收藏，含 <b>TV / WEB / OVA / 剧场版 / 其它</b> 全部动画类型（可在结果顶部勾选要显示的类型）。' +
+        '<b>追番</b>＝收藏年份 ≤ 条目完结年份；<b>补番</b>＝收藏年份 &gt; 完结年份。' +
+        '完结年份优先取条目信息里的“放送结束/完结”，缺失时退回季度标签年份；收藏年份取官方收藏接口的收藏时间（需访问令牌），未填令牌时尽力从收藏列表页解析日期。' +
+        '缺任一时间则该条计入“无法判断”。数据只读，不会修改你的收藏。</div>';
+    } else {
+      html += '<div class="bgmss-note">统计口径：仅「看过 / 在看」中的 动画(TV)，按条目“标签”里的 “xxxx年x月” 判定季度，只保留 1/4/7/10 月四季；' +
+        '开播时间特殊的月份（如 2月、11月）自动归入其所属季度（1-3月→1月季、4-6月→4月季、7-9月→7月季、10-12月→10月季）。' +
+        '剧场版 / OVA / WEB / 其它平台、以及没有该格式季度标签的条目不计入。数据只读，不会修改你的收藏。</div>';
     }
-    html += '</div>';
+    if (state.skips.apiError) {
+      html += '<div class="bgmss-note">提示：API 获取失败多为 <b>404</b>（最常见是 <b>R18 条目</b>——R18 仅注册满两个月且带认证的账号可访问，匿名请求返回 404；' +
+        '也可能是被合并/删除的条目）。可在 bgm.tv/dev/app 创建“个人访问令牌”填入面板，脚本会带认证重读；用“导出失败清单”核对具体条目。</div>';
+    }
     return html;
   }
 
@@ -823,6 +1421,8 @@
     if (exp) exp.addEventListener('click', exportCSV);
     var expf = document.getElementById('bgmss-export-fail');
     if (expf) expf.addEventListener('click', exportFailCSV);
+    var snapBtn = document.getElementById('bgmss-snapshot-clear');
+    if (snapBtn) snapBtn.addEventListener('click', clearSnapshot);
     var cp = document.getElementById('bgmss-copy');
     if (cp) cp.addEventListener('click', copySummary);
     var cc = document.getElementById('bgmss-cache-clear');
@@ -877,16 +1477,36 @@
   }
 
   function copySummary() {
-    var lines = ['Bangumi 季度番剧统计（TV · 依据条目季度标签）', ''];
-    var total = 0;
-    seasonOrder.forEach(function (k) {
-      var s = state.seasonMap[k];
-      total += s.count;
-      var ql = quarterLabel(s.month);
-      lines.push(s.year + '年' + s.month + '月' + (ql ? '（' + ql + '）' : '') + '：' + s.count + ' 部');
-    });
-    lines.push('');
-    lines.push('合计：' + total + ' 部 / ' + seasonOrder.length + ' 个季度');
+    var lines;
+    if (state.mode === 'retire') {
+      var rows = retireFilteredRows().filter(function (r) { return r.valid; });
+      var years = retireYearBuckets(rows);
+      var z = 0, b = 0;
+      rows.forEach(function (r) { if (r.kind === 'zhui') z++; else b++; });
+      var known = z + b;
+      var kinds = Object.keys(state.typeFilter || {}).filter(function (k) { return state.typeFilter[k] !== false; })
+        .map(function (k) { return PLAT_LABELS[k] || k; }).join('、');
+      lines = ['Bangumi 追番/补番统计（按收藏年份 · 类型：' + kinds + '）', '统计对象：' + (state.runUser || settings.user), ''];
+      Object.keys(years).map(Number).sort(function (a, b2) { return a - b2; }).forEach(function (y) {
+        var d = years[y];
+        var rate = d.total ? Math.round((d.zhui / d.total) * 1000) / 10 : 0;
+        lines.push(y + ' 年：追番 ' + d.zhui + ' 部 / 补番 ' + d.bui + ' 部（合计 ' + d.total + '，追番比例 ' + rate + '%）');
+      });
+      lines.push('');
+      lines.push('合计：追番 ' + z + ' 部 / 补番 ' + b + ' 部（可判断 ' + known + ' 部，追番比例 ' +
+        (known ? Math.round((z / known) * 1000) / 10 : 0) + '%）');
+    } else {
+      lines = ['Bangumi 季度番剧统计（TV · 依据条目季度标签）', '统计对象：' + (state.runUser || settings.user), ''];
+      var total = 0;
+      seasonOrder.forEach(function (k) {
+        var s = state.seasonMap[k];
+        total += s.count;
+        var ql = quarterLabel(s.month);
+        lines.push(s.year + '年' + s.month + '月' + (ql ? '（' + ql + '）' : '') + '：' + s.count + ' 部');
+      });
+      lines.push('');
+      lines.push('合计：' + total + ' 部 / ' + seasonOrder.length + ' 个季度');
+    }
     var text = lines.join('\n');
     var ta = document.createElement('textarea');
     ta.value = text;
@@ -992,10 +1612,14 @@
     panel.style.cssText = 'display:none;position:fixed;top:72px;left:50%;transform:translateX(-50%);width:min(860px,calc(100vw - 40px));max-height:80vh;overflow:auto;z-index:2147483000;background:#fff;border:1px solid #e2e6ee;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.22);color:#222;font-size:13px;line-height:1.6;font-family:"PingFang SC","Microsoft YaHei",sans-serif;';
     panel.innerHTML = [
       '<div style="padding:12px 14px;border-bottom:1px solid #eee;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:#fff;z-index:2;">',
-      '<b style="font-size:15px;">📊 Bangumi 季度番剧统计 <span style="color:#999;font-weight:normal;font-size:11px;">v' + VERSION + '</span></b>',
+      '<b style="font-size:15px;">📊 Bangumi 追番统计 <span style="color:#999;font-weight:normal;font-size:11px;">v' + VERSION + '</span></b>',
       '<button id="bgmss-min" style="border:1px solid #ddd;background:#fff;border-radius:6px;cursor:pointer;padding:2px 9px;font-size:13px;">收起</button>',
       '</div>',
       '<div style="padding:12px 14px;">',
+      '<div style="display:flex;gap:8px;margin-bottom:10px;">',
+      '<button class="bgmss-tab active" data-mode="season">季度番剧统计</button>',
+      '<button class="bgmss-tab" data-mode="retire">追番 / 补番统计</button>',
+      '</div>',
       '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">',
       '<label>用户名 <input id="bgmss-user" type="text" style="width:130px;padding:4px 6px;border:1px solid #ccc;border-radius:5px;"></label>',
       '<label>请求间隔 <input id="bgmss-delay" type="number" min="200" step="100" style="width:76px;padding:4px 6px;border:1px solid #ccc;border-radius:5px;"> ms</label>',
@@ -1004,9 +1628,10 @@
       '<button id="bgmss-start" style="padding:6px 14px;border:none;border-radius:6px;background:#52c41a;color:#fff;cursor:pointer;font-size:13px;">▶ 开始统计</button>',
       '<button id="bgmss-stop" style="padding:6px 14px;border:none;border-radius:6px;background:#f5222d;color:#fff;cursor:pointer;font-size:13px;" disabled>⏹ 停止</button>',
       '</div>',
+      '<div id="bgmss-modehint"></div>',
       '<div style="margin-top:8px;">',
       '<label style="margin-right:6px;">访问令牌</label>',
-      '<input id="bgmss-token" type="password" placeholder="可选：bgm.tv/dev/app 创建，用于读取 R18 条目" style="width:280px;padding:4px 6px;border:1px solid #ccc;border-radius:5px;">',
+      '<input id="bgmss-token" type="password" placeholder="可选：bgm.tv/dev/app 创建，追/补统计与 R18 条目都建议填" style="width:320px;padding:4px 6px;border:1px solid #ccc;border-radius:5px;">',
       '<span style="color:#999;font-size:11px;margin-left:6px;">令牌仅保存在本浏览器，请求 api.bgm.tv 时附加认证</span>',
       '</div>',
       '<div id="bgmss-log" style="margin-top:8px;min-height:18px;color:#555;"></div>',
@@ -1015,10 +1640,11 @@
       '<div id="bgmss-progressText" style="font-size:12px;color:#777;margin-top:3px;"></div>',
       '<div id="bgmss-results" style="margin-top:10px;display:none;"></div>',
       '<div style="margin-top:8px;color:#888;font-size:12px;border-top:1px dashed #e5e5e5;padding-top:6px;">',
-      '说明：仅统计「看过/在看」收藏中类型为动画、平台为 TV，且条目“标签”含 “xxxx年x月” 格式（如 2025年1月）的条目；剧场版、OVA、WEB 等不计入。<br>',
-      '只保留 1/4/7/10 月四个季度，开播时间特殊的月份按所属季度归并（1-3月→1月季、4-6月→4月季、7-9月→7月季、10-12月→10月季）。<br>',
-      '列表页抓取自当前域名的 /anime/list，条目详情读取自 <a href="https://api.bgm.tv" target="_blank" rel="noopener">api.bgm.tv</a>。R18 条目仅注册满两个月且带认证的账号可访问（匿名会 404）；' +
-      '如需统计请在上方填入个人访问令牌。详情有 7 天本地缓存，可重复运行。</div>',
+      '两种模式都统计「看过/在看」收藏，且都是只读操作。<br>',
+      '· <b>季度番剧统计</b>：仅 TV 动画，按条目“标签”里的 “xxxx年x月” 判定季度，只保留 1/4/7/10 月四季（特殊月份按所属季度归并，如 2月→1月季、11月→10月季）。<br>',
+      '· <b>追番 / 补番统计</b>：包含 TV / WEB / OVA / 剧场版 等全部动画类型，收藏年份 ≤ 条目完结年份算追番，否则算补番；结果顶部可多选要显示的类型。<br>',
+      '统计结果会自动保存在本浏览器，之后打开主页点“启动”即可直接看到，点“开始统计”才更新数据。<br>',
+      '列表页抓取自当前域名的 /anime/list，条目详情读取自 <a href="https://api.bgm.tv" target="_blank" rel="noopener">api.bgm.tv</a>。详情有 7 天本地缓存，可重复运行。</div>',
       '</div>'
     ].join('');
     document.body.appendChild(panel);
@@ -1060,6 +1686,42 @@
       });
     }
     panel.querySelector('#bgmss-min').addEventListener('click', function () { panel.style.display = 'none'; });
+
+    // 顶部模式切换：季度番剧统计 / 追番·补番统计
+    dom.modeHint = panel.querySelector('#bgmss-modehint');
+    function updateModeHint() {
+      if (!dom.modeHint) return;
+      dom.modeHint.innerHTML = state.mode === 'retire'
+        ? '当前模式：<b>追番 / 补番统计</b>（按收藏年份）。含 TV / WEB / OVA / 剧场版 等全部类型，结果顶部可勾选显示哪些类型；收藏年份需要访问令牌（推荐）或列表页日期。'
+        : '当前模式：<b>季度番剧统计</b>（按条目“xxxx年x月”标签，仅 TV，保留 1/4/7/10 月四季）。';
+    }
+    panel.querySelectorAll('.bgmss-tab').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        state.mode = btn.getAttribute('data-mode') === 'retire' ? 'retire' : 'season';
+        settings.mode = state.mode;
+        saveSettings();
+        panel.querySelectorAll('.bgmss-tab').forEach(function (b) {
+          b.className = 'bgmss-tab' + (b === btn ? ' active' : '');
+        });
+        dom.results.innerHTML = '';
+        dom.results.style.display = 'none';
+        state.snapshotTs = 0;
+        updateModeHint();
+        // 该模式若已有保存的结果，直接显示，无需重新统计
+        if (restoreSnapshot(state.mode)) {
+          setLog('已显示「' + (state.mode === 'retire' ? '追番 / 补番统计' : '季度番剧统计') + '」上次保存的结果；点击“开始统计”可更新。', 'ok');
+        } else {
+          setLog(state.mode === 'retire'
+            ? '已切换到「追番 / 补番统计」：点击“开始统计”运行。'
+            : '已切换到「季度番剧统计」：点击“开始统计”运行。');
+        }
+      });
+    });
+    updateModeHint();
+    // 按当前模式高亮对应页签
+    panel.querySelectorAll('.bgmss-tab').forEach(function (b) {
+      b.className = 'bgmss-tab' + (b.getAttribute('data-mode') === state.mode ? ' active' : '');
+    });
     return panel;
   }
 
@@ -1087,6 +1749,10 @@
     if (document.getElementById('bgmSeasonStatsPanel')) return;
     var panel = buildPanel();
     applyProfileUser(); // 主页直接预填，无需手动输入
+    // 打开面板即显示上次保存的结果（不重新抓取）
+    if (restoreSnapshot(state.mode)) {
+      setLog('已显示上次保存的统计结果（' + formatTs(state.snapshotTs) + '）；点击“开始统计”可更新数据。', 'ok');
+    }
     mountTrigger(panel, 0);
   }
 
@@ -1107,6 +1773,16 @@
       '.bgmss-yearlabel{font-weight:bold;color:#1890ff;margin-bottom:6px;font-size:13px;text-align:center;border-bottom:1px solid #e8eef7;padding-bottom:2px;}',
       '.bgmss-yearbars{display:flex;flex-direction:row;align-items:flex-end;height:232px;padding-top:6px;border-bottom:1px solid #c9d4e0;/* 固定绘图区高度，柱子统一底部对齐 */}',
       '.bgmss-scroll{overflow-x:auto;padding-bottom:6px;}',
+      '.bgmss-stack{display:flex;flex-direction:column;justify-content:flex-end;width:38px;border-radius:4px 4px 0 0;overflow:hidden;box-shadow:inset 0 -3px 6px rgba(0,0,0,.12);}',
+      '.bgmss-seg{width:100%;display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;overflow:hidden;}',
+      '.bgmss-seg.seg-zhui{background:#2f6fdb;}',
+      '.bgmss-seg.seg-bui{background:#f2a33c;}',
+      '.bgmss-tab{padding:4px 14px;border:1px solid #d0d7e2;background:#f7f9fc;border-radius:999px;cursor:pointer;font-size:12px;color:#333;}',
+      '.bgmss-tab:hover{background:#eef3fb;}',
+      '.bgmss-tab.active{background:#2f6fdb;border-color:#2f6fdb;color:#fff;}',
+      '.bgmss-typechk{display:inline-block;margin-right:12px;font-size:12px;cursor:pointer;user-select:none;}',
+      '.bgmss-typechk input{margin-right:3px;vertical-align:middle;}',
+      '#bgmss-modehint{margin-top:6px;color:#888;font-size:11px;line-height:1.7;}',
       '.bgmss-legend{margin:4px 6px 2px;}',
       '.bgmss-legend .lg{display:inline-block;margin-right:14px;font-size:12px;color:#555;}',
       '.bgmss-legend .lg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;}',
