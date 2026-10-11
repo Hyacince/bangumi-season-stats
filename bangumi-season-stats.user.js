@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bangumi 季度番剧统计
 // @namespace    bgm-season-stats
-// @version      1.5.0
-// @description  统计 Bangumi 用户“看过/在看”收藏中 TV 动画：① 季度番剧统计（依据条目标签 “xxxx年x月”，只保留 1/4/7/10 月四季，特殊开播月份按所属季度归并）；② 追番/补番统计（收藏年份 ≤ 条目完结年份为追番，否则为补番），展示每年数量与比例。入口为个人主页“加入”日期所在行的蓝色胶囊“季度番剧统计 + 启动”，点击后自动填入当前主页用户名，仅本用户主页显示。
+// @version      1.6.0
+// @description  统计 Bangumi 用户“看过/在看”收藏中动画：① 季度番剧统计（依据条目标签 “xxxx年x月”，只保留 1/4/7/10 月四季，特殊开播月份按所属季度归并）；② 追番/补番统计（收藏年份 ≤ 条目完结年份为追番，否则为补番），支持类型多选筛选。增量更新：日常只抓新增条目，结果自动保存，打开个人主页即可查看。入口位于个人主页“加入”日期所在行。
 // @author       dsh
 // @match        *://bgm.tv/*
 // @match        *://bangumi.tv/*
@@ -21,7 +21,7 @@
   // ---------------------------------------------------------------------------
   // 常量
   // ---------------------------------------------------------------------------
-  var VERSION = '1.5.0';
+  var VERSION = '1.6.0';
   var UA = (typeof navigator !== 'undefined' && navigator.userAgent) || 'Mozilla/5.0';
   // 季度标签：仅匹配 "xxxx年x月"（例如 2025年1月、2026年7月）
   var SEASON_RE = /^(\d{4})\s*年\s*(\d{1,2})\s*月$/;
@@ -30,7 +30,6 @@
   var LS_SETTINGS = 'bgmSeasonStats.settings';
   var LS_CACHE = 'bgmSeasonStats.cache.v4';
   var LS_SNAPSHOT = 'bgmSeasonStats.snapshot.v1'; // 统计结果快照（跨页面/刷新保留）
-  var CACHE_TTL = 7 * 24 * 3600 * 1000; // 条目详情本地缓存 7 天
   var MAX_LIST_PAGES = 300; // 每种收藏状态最多翻页数（安全上限）
   var MAX_DETAIL_RETRY = 4;
 
@@ -60,6 +59,8 @@
     retire: { rows: [], kindCounts: {}, noTime: 0, noEnd: 0, unknown: 0 },
     typeFilter: { tv: true, web: true, ova: true, movie: true, other: true }, // 追/补统计要显示的类型
     lastTotalRaw: 0,
+    lastFetchCount: 0, // 本次运行实际抓取的条目数
+    cacheHits: 0,      // 本次运行复用缓存的条目数
     snapshotTs: 0,    // 当前展示结果对应的统计时间
     seasonMap: {}      // "2025-1" -> { year, month, count, items: [] }
   };
@@ -555,7 +556,9 @@
     return out;
   }
 
-  // 读取本地缓存（顺带清理过期项：普通结果 7 天，API 失败 2 小时后允许重试）
+  // 读取本地缓存。
+  // 增量更新策略：条目详情长期缓存、不按时间过期（动画的平台/标签/完结日期极少变化），
+  // 只有失败结果（apiError）2 小时后才允许重试；需要刷新时用「清除条目缓存」或勾选「强制重抓全部详情」。
   function loadDiskCache() {
     try {
       var raw = localStorage.getItem(LS_CACHE);
@@ -566,8 +569,7 @@
       Object.keys(o).forEach(function (id) {
         var v = o[id];
         if (!v || !v.ts) { pruned = true; delete o[id]; return; }
-        var ttl = v.skip === 'apiError' ? 2 * 3600 * 1000 : CACHE_TTL;
-        if (now - v.ts > ttl) { pruned = true; delete o[id]; }
+        if (v.skip === 'apiError' && now - v.ts > 2 * 3600 * 1000) { pruned = true; delete o[id]; }
       });
       if (pruned) {
         try { localStorage.setItem(LS_CACHE, JSON.stringify(o)); } catch (e) { /* ignore */ }
@@ -613,7 +615,8 @@
       failedList: state.failedList || [],
       seasonMap: state.mode === 'season' ? state.seasonMap : null,
       retire: state.mode === 'retire' ? state.retire : null,
-      totalRaw: state.lastTotalRaw || 0
+      totalRaw: state.lastTotalRaw || 0,
+      cacheHits: state.cacheHits || 0
     };
     try {
       localStorage.setItem(LS_SNAPSHOT, JSON.stringify(all));
@@ -642,6 +645,7 @@
     state.failedList = snap.failedList || [];
     state.runUser = snap.user || settings.user;
     state.lastTotalRaw = snap.totalRaw || 0;
+    state.cacheHits = snap.cacheHits || 0;
     state.snapshotTs = snap.ts;
     if (mode === 'season') {
       state.seasonMap = snap.seasonMap || {};
@@ -663,8 +667,8 @@
     var who = esc(state.runUser || settings.user);
     var color = restored ? '#f6f8fb' : '#f0fff4';
     var note = restored
-      ? '这是上次保存的结果，点击「▶ 开始统计」可更新数据'
-      : '本次统计完成';
+      ? '这是上次保存的结果，点击「▶ 开始统计」可增量更新（只抓新增条目）'
+      : ('本次统计完成：新增抓取 ' + (state.lastFetchCount || 0) + ' 条 · 复用缓存 ' + (state.cacheHits || 0) + ' 条');
     return '<div class="bgmss-block" style="padding:7px 12px;background:' + color + ';border-color:#e3e9f2;color:#555;font-size:12px;">' +
       '🕒 ' + when + ' · 统计对象：<b>' + who + '</b> · ' + note + '</div>';
   }
@@ -818,16 +822,27 @@
         return;
       }
 
-      // 3) 逐个获取条目详情（跳过有效本地缓存）
+      // 3) 增量更新：只抓「新增/未缓存」的条目详情，其余直接用长期缓存
+      var forceRefresh = !!(dom.chkForce && dom.chkForce.checked);
       var needFetch = [];
+      var cacheHits = 0;
       union.forEach(function (id) {
-        if (cacheUsable(memCache[id])) return;
-        if (!memCache[id] && cacheUsable(diskCache[id])) return;
+        if (!forceRefresh) {
+          if (cacheUsable(memCache[id])) { cacheHits++; return; }
+          if (!memCache[id] && cacheUsable(diskCache[id])) { cacheHits++; return; }
+        }
         needFetch.push(id);
       });
       state.pending = needFetch.length;
-      setLog('共 ' + union.length + ' 条去重条目，其中 ' + needFetch.length + ' 条需要获取详情（约 ' +
-        Math.ceil((needFetch.length * settings.delay + union.length * 300) / 60000) + ' 分钟，间隔 ' + settings.delay + 'ms）…');
+      state.cacheHits = cacheHits;
+      state.lastFetchCount = needFetch.length;
+      if (forceRefresh) {
+        setLog('已勾选“强制重抓全部详情”：将重新抓取全部 ' + union.length + ' 条（忽略缓存）…');
+      } else {
+        setLog('共 ' + union.length + ' 条去重条目：缓存命中 ' + cacheHits + ' 条，需抓取 ' + needFetch.length +
+          ' 条（新增/未缓存），预计约 ' + Math.ceil((needFetch.length * settings.delay + union.length * 200) / 60000) +
+          ' 分钟（间隔 ' + settings.delay + 'ms）…');
+      }
 
       for (var k = 0; k < needFetch.length; k++) {
         if (state.stopped) break;
@@ -1625,6 +1640,7 @@
       '<label>请求间隔 <input id="bgmss-delay" type="number" min="200" step="100" style="width:76px;padding:4px 6px;border:1px solid #ccc;border-radius:5px;"> ms</label>',
       '<label><input id="bgmss-ck-collect" type="checkbox" checked> 看过</label>',
       '<label><input id="bgmss-ck-do" type="checkbox" checked> 在看</label>',
+      '<label title="默认只抓取新增条目；勾选后将忽略缓存、重新抓取全部条目详情"><input id="bgmss-force" type="checkbox"> 强制重抓全部详情</label>',
       '<button id="bgmss-start" style="padding:6px 14px;border:none;border-radius:6px;background:#52c41a;color:#fff;cursor:pointer;font-size:13px;">▶ 开始统计</button>',
       '<button id="bgmss-stop" style="padding:6px 14px;border:none;border-radius:6px;background:#f5222d;color:#fff;cursor:pointer;font-size:13px;" disabled>⏹ 停止</button>',
       '</div>',
@@ -1644,6 +1660,7 @@
       '· <b>季度番剧统计</b>：仅 TV 动画，按条目“标签”里的 “xxxx年x月” 判定季度，只保留 1/4/7/10 月四季（特殊月份按所属季度归并，如 2月→1月季、11月→10月季）。<br>',
       '· <b>追番 / 补番统计</b>：包含 TV / WEB / OVA / 剧场版 等全部动画类型，收藏年份 ≤ 条目完结年份算追番，否则算补番；结果顶部可多选要显示的类型。<br>',
       '统计结果会自动保存在本浏览器，之后打开主页点“启动”即可直接看到，点“开始统计”才更新数据。<br>',
+      '更新为<b>增量模式</b>：只抓取新增/未缓存的条目，已抓过的条目长期复用缓存（通常几十秒完成）；需要刷新旧条目时勾选“强制重抓全部详情”或点“清除条目缓存”。<br>',
       '列表页抓取自当前域名的 /anime/list，条目详情读取自 <a href="https://api.bgm.tv" target="_blank" rel="noopener">api.bgm.tv</a>。详情有 7 天本地缓存，可重复运行。</div>',
       '</div>'
     ].join('');
@@ -1654,6 +1671,7 @@
     dom.tokenInput = panel.querySelector('#bgmss-token');
     dom.chkCollect = panel.querySelector('#bgmss-ck-collect');
     dom.chkDo = panel.querySelector('#bgmss-ck-do');
+    dom.chkForce = panel.querySelector('#bgmss-force');
     dom.btnStart = panel.querySelector('#bgmss-start');
     dom.btnStop = panel.querySelector('#bgmss-stop');
     dom.log = panel.querySelector('#bgmss-log');
